@@ -7,7 +7,7 @@
 	<manufacturer>Atari Games</manufacturer>
 	<rotation>horizontal</rotation>
 	<mraauthor>Nortido</mraauthor>
-	<about author="Nortido" source="https://github.com/nortido/Arcade-PrimalRage_MiSTer"/>
+	<about author="Nortido" source="https://github.com/MiSTer-devel/Arcade-PrimalRage_MiSTer"/>
 	<rom index="0" zip="primrage.zip" md5="c3b9bef2463ae00a113eaf0fffcbcf6b" address="0x38000000">
 		<!-- map: one hex digit per output byte, right = byte 0 (lowest address, MiSTer reads the string from the right); the set bit picks which part fills that byte -->
 		<interleave output="32">
