@@ -2,6 +2,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE Arcade-PrimalRage.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sync_shift.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/atarigt_inputs.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/nvram_hps.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/rom_ddr_replay.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu_bus.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/atarigt_video.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/rle_objects.sv

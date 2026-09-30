@@ -127,8 +127,9 @@ pll pll
 );
 
 // only ioctl_index 0 is ROM data; anything else (savestates etc) is
-// not a ROM download and must not reset the CPU or trigger a prescan
-wire rom_download = ioctl_download & (ioctl_index[7:0] == 8'd0);
+// not a ROM download and must not reset the CPU or trigger a prescan.
+// Driven by rom_ddr_replay: the window includes the DDR staging replay
+wire rom_download;
 
 // mod byte (MRA rom index 1, single byte at offset 0): 0 selects the
 // primrageo input layout, 1 selects primrage. Power-up default 0; must
@@ -167,7 +168,7 @@ wire cpu_reset = reset | rom_download | ~prescan_done | ~ram_clear_done;
 reg cpu_reset_cpu_m, cpu_reset_cpu;
 always @(posedge clk_cpu) {cpu_reset_cpu, cpu_reset_cpu_m} <= {cpu_reset_cpu_m, cpu_reset};
 
-assign LED_USER = ioctl_download;
+assign LED_USER = ioctl_download | rom_download;
 
 ///////////////////////   250 Hz SCANLINE TICK   //////////////////
 // runs on clk_cpu now, alongside cpu_bus: 42954545/250 clocks
@@ -197,11 +198,23 @@ wire        ld_ddr_pending;
 wire        ld_dbg_active;
 wire [15:0] cage_dsp_we_count;
 
-rom_loader rom_loader
+wire        ld_download;
+wire [15:0] ld_index;
+wire        ld_wr;
+wire [26:0] ld_addr;
+wire  [7:0] ld_dout;
+wire        ld_wait;
+
+wire [28:0] stg_ddr_addr;
+wire        stg_ddr_rd;
+wire [63:0] stg_ddr_dout;
+wire        stg_ddr_dout_ready;
+wire        stg_ddr_busy;
+
+rom_ddr_replay rom_ddr_replay
 (
 	.clk(clk_sys),
 	.reset(loader_reset),
-	.soft_reset(RESET | status[0] | buttons[1] | nvram_download),
 
 	.ioctl_download(ioctl_download),
 	.ioctl_index(ioctl_index),
@@ -209,6 +222,36 @@ rom_loader rom_loader
 	.ioctl_addr(ioctl_addr),
 	.ioctl_dout(ioctl_dout),
 	.ioctl_wait(ioctl_wait),
+
+	.ld_download(ld_download),
+	.ld_index(ld_index),
+	.ld_wr(ld_wr),
+	.ld_addr(ld_addr),
+	.ld_dout(ld_dout),
+	.ld_wait(ld_wait),
+	.ld_ddr_pending(ld_ddr_pending),
+
+	.rom_download(rom_download),
+
+	.ddr_addr(stg_ddr_addr),
+	.ddr_rd(stg_ddr_rd),
+	.ddr_dout(stg_ddr_dout),
+	.ddr_dout_ready(stg_ddr_dout_ready),
+	.ddr_busy(stg_ddr_busy)
+);
+
+rom_loader rom_loader
+(
+	.clk(clk_sys),
+	.reset(loader_reset),
+	.soft_reset(RESET | status[0] | buttons[1] | nvram_download),
+
+	.ioctl_download(ld_download),
+	.ioctl_index(ld_index),
+	.ioctl_wr(ld_wr),
+	.ioctl_addr(ld_addr),
+	.ioctl_dout(ld_dout),
+	.ioctl_wait(ld_wait),
 
 	.sdram_addr(ld_sdram_addr),
 	.sdram_din(ld_sdram_din),
@@ -295,6 +338,12 @@ ddr_arbiter ddr_arbiter
 	.cage_dout(cage_ddr_dout),
 	.cage_dout_ready(cage_ddr_dout_ready),
 	.cage_busy(cage_ddr_busy),
+
+	.stg_addr(stg_ddr_addr),
+	.stg_rd(stg_ddr_rd),
+	.stg_dout(stg_ddr_dout),
+	.stg_dout_ready(stg_ddr_dout_ready),
+	.stg_busy(stg_ddr_busy),
 
 	.DDRAM_CLK(DDRAM_CLK),
 	.DDRAM_BUSY(DDRAM_BUSY),
@@ -797,8 +846,8 @@ endmodule
 // began (see dbg_hold below). The FIFO drains into the same SDRAM/DDR
 // engines as before, one pending write per engine, held until not busy
 // per the Avalon waitrequest convention (see mdp_audio.sv DDR_REQ). At
-// download end, once the FIFO has drained and any half-word/partial-group
-// is flushed, the loader moves on to whatever the debug block below wants next.
+// download end, once the FIFO has drained, the loader moves on to whatever
+// the debug block below wants next.
 //
 // Debug block: does not depend on download_end (that trigger was lost
 // on the board), so it fires periodically (every 2^25 clk_sys cycles)
@@ -909,7 +958,6 @@ wire do_issue = ~fifo_empty & ~pend_sdram & ~pend_ddr & ~pop_pending;
 
 reg        hi_valid;
 reg  [7:0] hi_byte;
-reg [26:0] hi_addr;
 reg  [2:0] ddr_cnt;
 reg [55:0] ddr_acc;
 reg [26:0] ddr_group_addr; // stream address of byte 0 of the in-progress group
@@ -927,6 +975,8 @@ reg [17:0] clr_cnt;
 reg        clr_done;
 assign ram_clear_done = clr_done;
 
+// a stream ending mid-word never drains here (hi_valid or ddr_cnt stays set);
+// every MRA layout is 8-byte aligned
 wire drain_complete = fifo_empty & ~pop_pending & ~pend_sdram & ~pend_ddr & ~hi_valid & (ddr_cnt == 0);
 
 // the debug sequence may only start or step while the loader is otherwise
@@ -1052,7 +1102,6 @@ always @(posedge clk) begin
 			if (!pop_object_region_r) begin
 				if (!pop_addr_r[0]) begin
 					hi_byte  <= pop_data_r;
-					hi_addr  <= pop_addr_r;
 					hi_valid <= 1'b1;
 				end else begin
 					sdram_din    <= {hi_byte, pop_data_r};
@@ -1084,30 +1133,6 @@ always @(posedge clk) begin
 			pop_addr_r  <= fifo_mem[fifo_rptr][34:8];
 			pop_data_r  <= fifo_mem[fifo_rptr][7:0];
 			pop_pending <= 1'b1;
-		end else if (ended && drain_complete && !dbg_active && (hi_valid || ddr_cnt != 0)) begin
-			// flush a half-assembled SDRAM word (low byte never arrived)
-			if (hi_valid) begin
-				sdram_din    <= {hi_byte, 8'h00};
-				sdram_wrl    <= 1'b0;
-				sdram_wrh    <= 1'b1;
-				sdram_addr   <= sdram_word_addr(hi_addr);
-				sdram_req    <= ~sdram_req;
-				pend_sdram   <= 1'b1;
-				sdram_wr_cnt <= sdram_wr_cnt + 1'd1;
-				hi_valid     <= 1'b0;
-			end
-			// flush a partial DDR3 group (fewer than 8 bytes seen); use the
-			// group's own base address, not whatever a prior completed
-			// group last left in ddr_addr
-			else if (ddr_cnt != 0) begin
-				ddr_addr   <= ddr_qword_addr(ddr_group_addr);
-				ddr_din    <= {8'h00, ddr_acc};
-				ddr_be     <= (8'h01 << ddr_cnt) - 8'h01;
-				ddr_we     <= 1'b1;
-				pend_ddr   <= 1'b1;
-				ddr_wr_cnt <= ddr_wr_cnt + 1'd1;
-				ddr_cnt    <= 0;
-			end
 		end else if (ended && drain_complete && !dbg_active && !clr_done) begin
 			sdram_din  <= 16'h0000;
 			sdram_wrl  <= 1'b1;
@@ -1130,7 +1155,7 @@ always @(posedge clk) begin
 		end else if (!pend_ddr && !dbg_hold && dbg_state != DBG_IDLE) begin
 			// dbg_hold keeps this from firing during/just after a download; a
 			// pop can still interleave between beats (~pend_ddr keeps the ddr
-			// bus race-free), the flush/clear paths above stay gated by dbg_active
+			// bus race-free), the clear path above stays gated by dbg_active
 			case (dbg_state)
 				DBG_Q0: begin
 					ddr_addr <= DEBUG_ADDR + 29'd1;
@@ -1203,7 +1228,7 @@ endmodule
 
 
 // ---------------------------------------------------------------------
-// ddr_arbiter: priority mux, three masters, priority rle > cage > loader.
+// ddr_arbiter: priority mux, four masters, priority rle > cage > stg > loader.
 // The bus changes owner only when the current owner has no burst in
 // flight (a per-owner outstanding-words counter), so a lower-priority
 // write can never steal words out of a running read. loader is lowest
@@ -1243,6 +1268,12 @@ module ddr_arbiter
 	output        cage_dout_ready,
 	output        cage_busy,
 
+	input [28:0] stg_addr,
+	input        stg_rd,
+	output [63:0] stg_dout,
+	output        stg_dout_ready,
+	output        stg_busy,
+
 	output        DDRAM_CLK,
 	input         DDRAM_BUSY,
 	output  [7:0] DDRAM_BURSTCNT,
@@ -1258,39 +1289,46 @@ module ddr_arbiter
 assign DDRAM_CLK = clk;
 
 reg [7:0] rle_words_left, cage_words_left;
+reg stg_active;
 wire rle_active  = (rle_words_left  != 0);
 wire cage_active = (cage_words_left != 0);
 
-// priority rle > cage > loader, but an owner mid-burst keeps the bus
+// priority rle > cage > stg > loader, but an owner mid-burst keeps the bus
 // regardless of who else wants it
-wire grant_rle    = rle_active  | (~cage_active & (rle_rd | rle_wr));
-wire grant_cage   = ~grant_rle  & (cage_active | cage_rd | cage_we);
-wire grant_loader = ~grant_rle  & ~grant_cage & loader_sel;
+wire grant_rle    = rle_active | (~cage_active & ~stg_active & (rle_rd | rle_wr));
+wire grant_cage   = ~grant_rle & (cage_active | (~stg_active & (cage_rd | cage_we)));
+wire grant_stg    = ~grant_rle & ~grant_cage & (stg_active | stg_rd);
+wire grant_loader = ~grant_rle & ~grant_cage & ~grant_stg & loader_sel;
 
 wire rle_rd_acc  = grant_rle  & rle_rd  & ~rle_active  & ~DDRAM_BUSY;
 wire cage_rd_acc = grant_cage & cage_rd & ~cage_active & ~DDRAM_BUSY;
+wire stg_rd_acc  = grant_stg  & stg_rd  & ~stg_active  & ~DDRAM_BUSY;
 
 always @(posedge clk) begin
 	if (reset) begin
 		rle_words_left  <= 0;
 		cage_words_left <= 0;
+		stg_active      <= 0;
 	end else begin
 		if (rle_rd_acc) rle_words_left <= rle_burstcnt;
 		else if (DDRAM_DOUT_READY && rle_active) rle_words_left <= rle_words_left - 1'd1;
 
 		if (cage_rd_acc) cage_words_left <= cage_burstcnt;
 		else if (DDRAM_DOUT_READY && cage_active) cage_words_left <= cage_words_left - 1'd1;
+
+		if (stg_rd_acc) stg_active <= 1;
+		else if (DDRAM_DOUT_READY && stg_active) stg_active <= 0;
 	end
 end
 
-wire is_write = grant_rle ? rle_wr : grant_cage ? cage_we : loader_we;
+wire is_write = grant_rle ? rle_wr : grant_cage ? cage_we : grant_stg ? 1'b0 : loader_we;
 
-assign DDRAM_ADDR     = grant_rle ? rle_addr : grant_cage ? cage_addr : loader_addr;
+assign DDRAM_ADDR     = grant_rle ? rle_addr : grant_cage ? cage_addr : grant_stg ? stg_addr : loader_addr;
 assign DDRAM_DIN      = grant_rle ? rle_din  : grant_cage ? cage_din  : loader_din;
 assign DDRAM_WE       = is_write;
-assign DDRAM_RD       = grant_rle ? rle_rd : grant_cage ? cage_rd : 1'b0;
+assign DDRAM_RD       = grant_rle ? rle_rd : grant_cage ? cage_rd : grant_stg ? stg_rd : 1'b0;
 // writes never burst (one qword at a time); BE only matters for writes
-assign DDRAM_BURSTCNT = is_write ? 8'd1 : (grant_rle ? rle_burstcnt : cage_burstcnt);
+assign DDRAM_BURSTCNT = is_write ? 8'd1 : (grant_rle ? rle_burstcnt : grant_stg ? 8'd1 : cage_burstcnt);
 assign DDRAM_BE       = is_write ? (grant_rle ? rle_be : grant_cage ? cage_be : loader_be) : 8'hff;
 
 // busy to a non-granted master is 1, so it cannot mistake a wait for
@@ -1298,13 +1336,16 @@ assign DDRAM_BE       = is_write ? (grant_rle ? rle_be : grant_cage ? cage_be : 
 assign loader_busy    = DDRAM_BUSY | ~grant_loader;
 assign rle_busy        = DDRAM_BUSY | ~grant_rle;
 assign cage_busy        = DDRAM_BUSY | ~grant_cage;
+assign stg_busy         = DDRAM_BUSY | ~grant_stg;
 
-// dout_ready routed to the owner only; grant_rle/grant_cage are mutually
-// exclusive so at most one of these is ever high on a given cycle
+// dout_ready routed to the owner only; grant_rle/grant_cage/grant_stg are
+// mutually exclusive so at most one of these is ever high on a given cycle
 assign rle_dout         = DDRAM_DOUT;
 assign rle_dout_ready    = DDRAM_DOUT_READY & rle_active;
 assign cage_dout        = DDRAM_DOUT;
 assign cage_dout_ready   = DDRAM_DOUT_READY & cage_active;
+assign stg_dout         = DDRAM_DOUT;
+assign stg_dout_ready   = DDRAM_DOUT_READY & stg_active;
 
 endmodule
 

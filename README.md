@@ -51,6 +51,7 @@ Default MiSTer gamepad mapping:
 - XGA protection chip modelled after MAME
 - Settings, high scores and audits saved as NVRAM
 - OSD options: aspect ratio, scandoubler, integer scaling, CRT H/V position, volume, service mode
+- The ROM set loads through DDR3 via the MRA `address` attribute: the game loads in about 8 s instead of about 48 s (board measurement, build 51)
 
 ---
 
@@ -71,7 +72,7 @@ See the [MiSTer Arcade ROM guide](https://github.com/MiSTer-devel/Main_MiSTer/wi
 ## Installation
 
 1. Copy the `.rbf` from `releases/` to `/_Arcade/cores`.
-2. Copy `Primal Rage.mra` from `releases/` to `/_Arcade`.
+2. Copy `Primal Rage.mra` from `releases/` to `/_Arcade`. Use it together with the `.rbf` of the same release: older cores cannot load it.
 3. Put `primrage.zip` into `/games/mame`.
 4. Start Primal Rage from the Arcade menu.
 
@@ -101,7 +102,7 @@ Some AI tools were used during development. All code went through human review. 
 3. The bitstream is written to `output_files/Arcade-PrimalRage.rbf`. A full build takes about 30 minutes.
 4. `clean.bat` removes the build outputs.
 
-The design is large: about 70% of the logic and 508 of 553 M10K blocks. The release build uses fitter seed 2 (`SEED` in `Arcade-PrimalRage.qsf`) and meets timing on every clock. Other seeds or code changes can move the slack by a few hundred picoseconds, so check the timing report after each build and try another seed if a clock fails.
+The design is large: about 70% of the logic and 508 of 553 M10K blocks. The release build uses fitter seed 31 (`SEED` in `Arcade-PrimalRage.qsf`) and meets timing on every clock. Other seeds or code changes can move the slack by a few hundred picoseconds, so check the timing report after each build and try another seed if a clock fails.
 
 ---
 
