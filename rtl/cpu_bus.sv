@@ -126,19 +126,21 @@ module cpu_bus_decode (
 	// bit 7 is the live VBLANK signal (atarigt.cpp SERVICE port), not a switch
 	wire [15:0] service_eff = {service[15:8], vblank, service[6:0]};
 
-	logic [7:0] eeprom_q;
+	logic [7:0] eeprom_q, eeprom_q_inv, nv_q_inv;
 
 	wire we_eeprom = !reset && state == ST_IDLE && cpu_wr && cram_ok && !need_sdram
 						   && !need_wait && is_eeprom && cpu_uds;
 
+	// stored inverted on both ports: the M10K powers up as zeros, which then
+	// reads as an erased 2816 (0xFF) when no .nvm is loaded
 	tdp_ram #(.AW(11), .DW(8)) u_eeprom (
-		.clk_a(clk_cpu), .addr_a(eeprom_idx), .din_a(cpu_dout[15:8]), .we_a(we_eeprom), .q_a(eeprom_q),
-		.clk_b(clk_nv), .addr_b(nv_addr), .din_b(nv_din), .we_b(nv_we), .q_b(nv_q)
+		.clk_a(clk_cpu), .addr_a(eeprom_idx), .din_a(~cpu_dout[15:8]), .we_a(we_eeprom), .q_a(eeprom_q_inv),
+		.clk_b(clk_nv), .addr_b(nv_addr), .din_b(~nv_din), .we_b(nv_we), .q_b(nv_q_inv)
 	);
+	assign eeprom_q = ~eeprom_q_inv;
+	assign nv_q     = ~nv_q_inv;
 
 `ifdef SIMULATION
-	// real EEPROM contents are meaningless here, just avoid X reads of
-	// never-written bytes; smaller than a valid-bit shadow array
 	initial begin
 		for (int i = 0; i < 2048; i++) u_eeprom.mem[i] = 8'h00;
 	end
