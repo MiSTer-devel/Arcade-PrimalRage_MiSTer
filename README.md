@@ -72,7 +72,7 @@ See the [MiSTer Arcade ROM guide](https://github.com/MiSTer-devel/Main_MiSTer/wi
 ## Installation
 
 1. Copy the `.rbf` from `releases/` to `/_Arcade/cores`.
-2. Copy `Primal Rage.mra` from `releases/` to `/_Arcade`. Use it together with the `.rbf` of the same release: older cores cannot load it.
+2. Copy `Primal Rage (version 2.3, Jan 1995).mra` from `releases/` to `/_Arcade`. Use it together with the `.rbf` of the same release: older cores cannot load it.
 3. Put `primrage.zip` into `/games/mame`.
 4. Start Primal Rage from the Arcade menu.
 
