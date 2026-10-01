@@ -7,6 +7,10 @@
 module cage_mem (
 	input               clk,
 	input               reset,
+	// widens the sound ROM window to 0xD00000-0xEFFFFF (T-MEK's 8MB CAGE
+	// ROM) instead of Primal Rage's 0xD00000-0xDFFFFF (4MB); reads above
+	// the active window's top stay 0 either way
+	input               tmek,
 
 	// CPU-side word port, 24-bit word address, one req/ack per access.
 	// req/we/addr/wdata may be held for as many cycles as the caller needs
@@ -78,6 +82,7 @@ module cage_mem (
 	// rest of that window mirrors the empty part of the region"); the rest
 	// falls through to the unmapped default of 0.
 	localparam [23:0] SOUNDROM_LO = 24'hD00000, SOUNDROM_HI = 24'hDFFFFF;
+	localparam [23:0] SOUNDROM_HI_TMEK = 24'hEFFFFF;
 
 	// DDR3 byte bases as qword (8 byte)
 	// addresses for the ddr_addr bus, matching rle_objects.sv's convention
@@ -131,7 +136,8 @@ module cage_mem (
 	wire ip_is_host     = p_addr == HOSTLATCH_ADDR;
 	wire ip_is_cageram  = p_addr >= CAGERAM_LO  && p_addr <= CAGERAM_HI;
 	wire ip_is_bootrom  = p_addr >= BOOTROM_LO  && p_addr <= BOOTROM_HI;
-	wire ip_is_soundrom = p_addr >= SOUNDROM_LO && p_addr <= SOUNDROM_HI;
+	wire [23:0] soundrom_hi = tmek ? SOUNDROM_HI_TMEK : SOUNDROM_HI;
+	wire ip_is_soundrom = p_addr >= SOUNDROM_LO && p_addr <= soundrom_hi;
 	wire ip_is_cached   = ip_is_cageram || ip_is_soundrom;
 	// MAME cage set_mcbl_mode: the C31 boot ROM overlays 0x000000-0x000FFF and
 	// trap n loads its vector from word n there, which holds 0x809FC0+n

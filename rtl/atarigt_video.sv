@@ -70,12 +70,18 @@ module atarigt_video (
 
 	input        [15:0] latch,
 
+	// T-Mek mixer select and second MO bitmap pixel (rle fb_rd_tm)
+	input               tmek,
+	input        [15:0] tm_rd_data,
+
 	output       [7:0]  r,
 	output       [7:0]  g,
 	output       [7:0]  b
 );
 
 	// buffer selection lives in rle_objects; kept for interface parity only
+	// tmek/tm_rd_data are wired into the mixer below; unused_ok covers only
+	// the truly interface-parity-only inputs
 	wire unused_ok = &{1'b0, frame_sel, latch};
 
 	// ------------------------------------------------------------------
@@ -193,10 +199,8 @@ module atarigt_video (
 	// several arrays into one register, both defeat BRAM inference.
 	// mram_rg/mram_b (128 entries, mixer-only) are small enough to stay as
 	// plain registered arrays with a combinational read.
-	// ------------------------------------------------------------------
-	(* ramstyle = "M10K" *) reg [7:0] tram_lo [0:16383], tram_hi [0:16383];
-	reg [15:0] mram_rg  [0:127];   // {R[7:0],G[7:0]} per {bank[1:0],value[4:0]}, mixer-only
-	reg [15:0] mram_b   [0:127];   // blue word, low byte is the pen level, mixer-only
+	reg [15:0] mram_rg  [0:127];   // {R[7:0],G[7:0]} per {bank[1:0],value[4:0]}, PR mixer-only
+	reg [15:0] mram_b   [0:127];   // blue word, low byte is the pen level, PR mixer-only
 	reg [15:0] color_latch;
 
 	// colorram_r in MAME returns whatever was last written at ANY word in
@@ -246,15 +250,56 @@ module atarigt_video (
 	);
 	wire [15:0] cram2_dout = {cram2_hi_q, cram2_lo_q};
 
-	// tram/mrg_shadow/mb_shadow have only the one (CPU) reader, so a plain
-	// write-array/read-array pair of always blocks per array is already a
-	// single-port BRAM, no duplication risk. Nobody outside the CPU domain
-	// touches them, so they (and their read registers) run on clk_cpu.
-	reg [7:0] tram_lo_q, tram_hi_q;
-	always @(posedge clk_cpu) if (tram_hit && cram_we[0]) tram_lo[tram_idx] <= cram_din[7:0];
-	always @(posedge clk_cpu) if (tram_hit && cram_we[1]) tram_hi[tram_idx] <= cram_din[15:8];
-	always @(posedge clk_cpu) tram_lo_q <= tram_lo[tram_idx];
-	always @(posedge clk_cpu) tram_hi_q <= tram_hi[tram_idx];
+	// TRAM: CPU port A, T-Mek mixer's read-only port B via tram2_addr_c
+	// (driven below, with the mixer); declared here since Icarus elaborates
+	// instance port connections before later declarations.
+	reg  [13:0] tram2_addr_c;
+	wire [7:0] tram_lo_q, tram_hi_q;     // port A (CPU)
+	wire [7:0] tram2_lo_q, tram2_hi_q;   // port B (T-Mek mixer)
+
+	tdp_ram #(.AW(14), .DW(8)) u_tram_lo (
+		.clk_a(clk_cpu), .clk_b(clk),
+		.addr_a(tram_idx), .din_a(cram_din[7:0]), .we_a(tram_hit && cram_we[0]), .q_a(tram_lo_q),
+		.addr_b(tram2_addr_c), .din_b(8'h00), .we_b(1'b0), .q_b(tram2_lo_q)
+	);
+	tdp_ram #(.AW(14), .DW(8)) u_tram_hi (
+		.clk_a(clk_cpu), .clk_b(clk),
+		.addr_a(tram_idx), .din_a(cram_din[15:8]), .we_a(tram_hit && cram_we[1]), .q_a(tram_hi_q),
+		.addr_b(tram2_addr_c), .din_b(8'h00), .we_b(1'b0), .q_b(tram2_hi_q)
+	);
+	wire [15:0] tram2_dout = {tram2_hi_q, tram2_lo_q};
+
+	// T-Mek per-channel MRAM: mra forced 0 (tm bits 11:9 are not used for the block; the
+	// blocks the game shows match block 0), so a write with mra word-index bits (12:10)
+	// nonzero is dropped, like mrg_qual/mb_qual; address bits come from the write address.
+	wire        tmek_mra_zero  = (cram_addr[13:11] == 3'b000);
+	wire [11:0] tmek_mram_widx = {cram_addr[15:14], cram_addr[10:6], cram_addr[5:1]};
+
+	// port B addresses are assigned with the mixer below; declared here
+	// since Icarus elaborates instance ports before continuous assigns
+	wire [11:0] tmek_mram_r_addr, tmek_mram_g_addr, tmek_mram_b_addr;
+	wire [7:0]  tmek_mram_r_q, tmek_mram_g_q, tmek_mram_b_q;
+	// port A (CPU) never reads these back (the CPU-visible copy is
+	// mrg_shadow/mb_shadow above); tie them off the same way unused_ok
+	// above ties off inputs nobody reads
+	wire [7:0]  tmek_mram_r_qa, tmek_mram_g_qa, tmek_mram_b_qa;
+	wire        tmek_mram_qa_unused = &{1'b0, tmek_mram_r_qa, tmek_mram_g_qa, tmek_mram_b_qa};
+
+	tdp_ram #(.AW(12), .DW(8)) u_tmek_mram_r (
+		.clk_a(clk_cpu), .clk_b(clk),
+		.addr_a(tmek_mram_widx), .din_a(cram_din[15:8]), .we_a(mrg_hit && tmek_mra_zero && cram_we[1]), .q_a(tmek_mram_r_qa),
+		.addr_b(tmek_mram_r_addr), .din_b(8'h00), .we_b(1'b0), .q_b(tmek_mram_r_q)
+	);
+	tdp_ram #(.AW(12), .DW(8)) u_tmek_mram_g (
+		.clk_a(clk_cpu), .clk_b(clk),
+		.addr_a(tmek_mram_widx), .din_a(cram_din[7:0]), .we_a(mrg_hit && tmek_mra_zero && cram_we[0]), .q_a(tmek_mram_g_qa),
+		.addr_b(tmek_mram_g_addr), .din_b(8'h00), .we_b(1'b0), .q_b(tmek_mram_g_q)
+	);
+	tdp_ram #(.AW(12), .DW(8)) u_tmek_mram_b (
+		.clk_a(clk_cpu), .clk_b(clk),
+		.addr_a(tmek_mram_widx), .din_a(cram_din[7:0]), .we_a(mb_hit && tmek_mra_zero && cram_we[0]), .q_a(tmek_mram_b_qa),
+		.addr_b(tmek_mram_b_addr), .din_b(8'h00), .we_b(1'b0), .q_b(tmek_mram_b_q)
+	);
 
 	reg [7:0] mrg_lo_q, mrg_hi_q, mb_lo_q, mb_hi_q;
 	always @(posedge clk_cpu) if (mrg_hit && cram_we[0]) mrg_shadow_lo[mram_shadow_idx] <= cram_din[7:0];
@@ -673,6 +718,7 @@ module atarigt_video (
 	reg [13:0] pf_s1;
 	reg [7:0]  an_s1;
 	reg [15:0] mo_d1;
+	reg [15:0] tm_d1; // second MO bitmap pixel (T-Mek only)
 	reg        de_s1;
 
 	always @(posedge clk) begin
@@ -680,6 +726,7 @@ module atarigt_video (
 			pf_s1 <= disp_sel_d1 ? pf_buf1_q : pf_buf0_q;
 			an_s1 <= disp_sel_d1 ? an_buf1_q : an_buf0_q;
 			mo_d1 <= fb_rd_data;
+			tm_d1 <= tm_rd_data;
 			de_s1 <= de_d1;
 		end
 	end
@@ -697,16 +744,30 @@ module atarigt_video (
 						   mo_wins  ? {2'b10, mo_d1[10:0]} :
 									  {1'b0, pf_s1[11:0]};
 
+	// T-Mek branch of screen_update: same mgep/an_opaque, but the MO-wins
+	// test drops PR's MVID11 (mo_d1[11]) override, and cra/tra both come
+	// from the same 3-way pick (alpha, mo, pf)
+	wire tmek_mo_wins = mo_nonzero && (mgep || (pf_s1[5:0] == 6'b0));
+
+	wire [12:0] tmek_cra_idx = an_opaque    ? {5'b0, an_s1} :
+								tmek_mo_wins ? {1'b1, mo_d1[11:0]} :
+											   {1'b0, pf_s1[11:0]};
+	wire [10:0] tmek_tra_idx = an_opaque    ? {3'b000, tm_d1[7:0]} :
+								tmek_mo_wins ? {1'b1, tm_d1[9:0]} :
+											   {1'b0, tm_d1[9:0]};
+
 	// registered (not combinational) so it only changes once per ce_pix: the
 	// cram2 array read below is now unconditional/fast, so if the address
 	// itself weren't frozen between ce_pix edges the read would keep
 	// chasing pf_s1's latest value and reach cram2_dout a full stage ahead
 	// of pf_s2 (which is ce_pix-gated), instead of holding still until
 	// pf_s2 catches up to the same snapshot.
-	always @(posedge clk) if (ce_pix) cram2_addr_c <= {color_latch[3], cra_idx};
+	always @(posedge clk) if (ce_pix) cram2_addr_c <= {color_latch[3], tmek ? tmek_cra_idx : cra_idx};
+	always @(posedge clk) if (ce_pix) tram2_addr_c <= {color_latch[5:4], 1'b0, tmek_tra_idx};
 
-	// stage 3: cram2_dout (declared with the colour RAM above) captures
-	// cram2_addr_c here; carry pf_s1/de_s1 forward alongside it
+	// stage 3: cram2_dout/tram2_dout (declared with the colour RAM above)
+	// capture cram2_addr_c/tram2_addr_c here; carry pf_s1/de_s1 forward
+	// alongside them
 	reg [13:0] pf_s2;
 	reg        de_s2;
 	always @(posedge clk) begin
@@ -721,9 +782,22 @@ module atarigt_video (
 	wire [4:0] cb5 = cram2_dout[4:0];
 	wire [1:0] mbank = color_latch[7:6];
 
-	wire [7:0] mix_r = mram_rg[{mbank, cr5}][15:8];
-	wire [7:0] mix_g = mram_rg[{mbank, cg5}][7:0];
-	wire [7:0] mix_b = mram_b [{mbank, cb5}][7:0];
+	// no_cra/no_tra read the pre-zero cram2_dout/tram2_dout (both aligned
+	// with pf_s2 here); R/G/B each then index MRAM by their own field of
+	// the (possibly zeroed) cra/tra.
+	wire tmek_no_cra = !pf_s2[12] && tram2_dout[15];
+	wire tmek_no_tra = cram2_dout[15] || (pf_s2[12] && (pf_s2[5:0] != 6'b0));
+
+	wire [15:0] tmek_cra = tmek_no_cra ? 16'h0000 : cram2_dout;
+	wire [15:0] tmek_tra = tmek_no_tra ? 16'h0000 : tram2_dout;
+
+	assign tmek_mram_r_addr = {mbank, tmek_tra[14:10], tmek_cra[14:10]};
+	assign tmek_mram_g_addr = {mbank, tmek_tra[9:5],   tmek_cra[9:5]};
+	assign tmek_mram_b_addr = {mbank, tmek_tra[4:0],   tmek_cra[4:0]};
+
+	wire [7:0] mix_r = tmek ? tmek_mram_r_q : mram_rg[{mbank, cr5}][15:8];
+	wire [7:0] mix_g = tmek ? tmek_mram_g_q : mram_rg[{mbank, cg5}][7:0];
+	wire [7:0] mix_b = tmek ? tmek_mram_b_q : mram_b [{mbank, cb5}][7:0];
 
 	wire white_ov = (color_latch[2:0] != 3'b0) &&
 					((pf_s2[5:0] == 6'b0) || (pf_s2[13] == 1'b0));

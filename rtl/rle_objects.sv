@@ -11,6 +11,7 @@ module rle_objects #(
 	input        [2:0]  control,
 	input        [15:0] mo_command,
 	input               vblank_rise,
+	input               tmek,
 
 	// CPU port to object RAM (D78000, 2K x 16)
 	input        [11:1] oram_addr,
@@ -23,6 +24,7 @@ module rle_objects #(
 	input        [7:0]  fb_rd_y,
 	input               fb_rd_frame,
 	output       [15:0] fb_rd_data,
+	output       [15:0] fb_rd_tm,
 	input               hblank,
 	input               vblank,
 	input        [7:0]  next_line,
@@ -194,6 +196,8 @@ module rle_objects #(
 	localparam integer FB_ROW_QW   = 84;          // 336 px / 4 px per qword
 	localparam [28:0]  FB0_QW_BASE = 29'h0680_0000; // byte 0x34000000 >> 3
 	localparam [28:0]  FB1_QW_BASE = 29'h0682_0000; // byte 0x34100000 >> 3
+	localparam [28:0]  TM0_QW_BASE = 29'h0684_0000; // byte 0x34200000 >> 3
+	localparam [28:0]  TM1_QW_BASE = 29'h0686_0000; // byte 0x34300000 >> 3
 
 	(* ramstyle = "M10K" *) logic [15:0] asm_lane0 [0:FB_ROW_QW-1];
 	(* ramstyle = "M10K" *) logic [15:0] asm_lane1 [0:FB_ROW_QW-1];
@@ -203,10 +207,12 @@ module rle_objects #(
 								// only flush the lanes actually drawn
 	logic        asm_open;
 	logic        asm_buf;
+	logic        asm_plane; // 1: T-MEK second plane (object word 1 bit 15)
 	logic [7:0]  asm_row;
 	logic        asm_first_touch; // row was not row_valid when opened
 
 	logic [FB_H-1:0] row_valid0, row_valid1;
+	logic [FB_H-1:0] tm_valid0, tm_valid1;
 
 	// pixel write request from the draw pipeline
 	logic        fb_wr_en;
@@ -283,6 +289,21 @@ module rle_objects #(
 	assign fb_rd_data = (fb_rd_x >= 9'd336 || fb_rd_y != rd_front_row) ? 16'h0 :
 						 (rd_front_sel ? rd1_sel : rd0_sel);
 
+	// second plane line buffers: whole qwords, one per prefetch beat
+	(* ramstyle = "M10K" *) logic [63:0] tm_rd0 [0:FB_ROW_QW-1];
+	(* ramstyle = "M10K" *) logic [63:0] tm_rd1 [0:FB_ROW_QW-1];
+	logic        tm_front_sel;
+	logic [7:0]  tm_front_row;
+
+	logic [63:0] tm_rd0_q_r, tm_rd1_q_r;
+	always_ff @(posedge clk) tm_rd0_q_r <= tm_rd0[fb_rd_qw];
+	always_ff @(posedge clk) tm_rd1_q_r <= tm_rd1[fb_rd_qw];
+
+	wire [63:0] tm_q   = tm_front_sel ? tm_rd1_q_r : tm_rd0_q_r;
+	wire [15:0] tm_sel = fb_rd_lane_r == 2'd0 ? tm_q[15:0]  : fb_rd_lane_r == 2'd1 ? tm_q[31:16] :
+						 fb_rd_lane_r == 2'd2 ? tm_q[47:32] : tm_q[63:48];
+	assign fb_rd_tm = (!tmek || fb_rd_x >= 9'd336 || fb_rd_y != tm_front_row) ? 16'h0 : tm_sel;
+
 	// prefetch FSM: on hblank, fetch next_line of fb_rd_frame's buffer
 	// into the back line buffer, then swap front/back. Independent of the
 	// main draw/prescan FSM below; it only asks for the DDR3 port through
@@ -296,6 +317,7 @@ module rle_objects #(
 	logic       pf_back_sel;     // which rd_lineN the prefetch is filling
 	logic       pf_buf_sel;      // which DDR mo buffer (fb_rd_frame at prefetch start)
 	logic [7:0] pf_row;
+	logic       pf_plane;        // 0: mo pass, 1: second plane pass (tmek only)
 
 	// the mo line prefetch wants the bus exactly when it is mid-row, has a
 	// real (row-valid) burst to fetch, and is between bursts; whether it
@@ -303,8 +325,14 @@ module rle_objects #(
 	wire pf_want_bus = pf_active && pf_row_ok && pf_burst_qw == 4'd0 &&
 						pf_qw_idx < FB_ROW_QW[6:0];
 	wire [6:0] pf_burst_left = FB_ROW_QW[6:0] - pf_qw_idx;
-	wire [28:0] pf_ddr_addr = (pf_buf_sel ? FB1_QW_BASE : FB0_QW_BASE) +
+	wire [28:0] pf_ddr_addr = (pf_plane ? (pf_buf_sel ? TM1_QW_BASE : TM0_QW_BASE) :
+										  (pf_buf_sel ? FB1_QW_BASE : FB0_QW_BASE)) +
 							  {14'h0, pf_row, 7'b0} + {22'h0, pf_qw_idx};
+
+	// the second pass reuses the row and buffer latched at the hblank edge
+	wire [7:0] pf_row_idx = (pf_row < 8'd240) ? pf_row : 8'd0;
+	wire pf_tm_row_ok = (pf_row < 8'd240) &&
+						 (pf_buf_sel ? tm_valid1[pf_row_idx] : tm_valid0[pf_row_idx]);
 
 	// next_line is 8 bits (0..255) but row_valid is only 240 deep: clamp
 	// the index so it never reads out of range, and a row >= 240 is simply
@@ -323,22 +351,29 @@ module rle_objects #(
 	wire [15:0] pf_p3 = pf_row_ok ? ddr_dout[63:48] : 16'h0;
 	wire pf_write_now = pf_active && pf_burst_qw > 4'd0 && pf_word_ok;
 
-	always_ff @(posedge clk) if (pf_write_now && !pf_back_sel) rd0_lane0[pf_qw_idx] <= pf_p0;
-	always_ff @(posedge clk) if (pf_write_now && !pf_back_sel) rd0_lane1[pf_qw_idx] <= pf_p1;
-	always_ff @(posedge clk) if (pf_write_now && !pf_back_sel) rd0_lane2[pf_qw_idx] <= pf_p2;
-	always_ff @(posedge clk) if (pf_write_now && !pf_back_sel) rd0_lane3[pf_qw_idx] <= pf_p3;
-	always_ff @(posedge clk) if (pf_write_now &&  pf_back_sel) rd1_lane0[pf_qw_idx] <= pf_p0;
-	always_ff @(posedge clk) if (pf_write_now &&  pf_back_sel) rd1_lane1[pf_qw_idx] <= pf_p1;
-	always_ff @(posedge clk) if (pf_write_now &&  pf_back_sel) rd1_lane2[pf_qw_idx] <= pf_p2;
-	always_ff @(posedge clk) if (pf_write_now &&  pf_back_sel) rd1_lane3[pf_qw_idx] <= pf_p3;
+	wire [63:0] pf_qword = pf_row_ok ? ddr_dout : 64'h0;
+
+	always_ff @(posedge clk) if (pf_write_now && !pf_plane && !pf_back_sel) rd0_lane0[pf_qw_idx] <= pf_p0;
+	always_ff @(posedge clk) if (pf_write_now && !pf_plane && !pf_back_sel) rd0_lane1[pf_qw_idx] <= pf_p1;
+	always_ff @(posedge clk) if (pf_write_now && !pf_plane && !pf_back_sel) rd0_lane2[pf_qw_idx] <= pf_p2;
+	always_ff @(posedge clk) if (pf_write_now && !pf_plane && !pf_back_sel) rd0_lane3[pf_qw_idx] <= pf_p3;
+	always_ff @(posedge clk) if (pf_write_now && !pf_plane &&  pf_back_sel) rd1_lane0[pf_qw_idx] <= pf_p0;
+	always_ff @(posedge clk) if (pf_write_now && !pf_plane &&  pf_back_sel) rd1_lane1[pf_qw_idx] <= pf_p1;
+	always_ff @(posedge clk) if (pf_write_now && !pf_plane &&  pf_back_sel) rd1_lane2[pf_qw_idx] <= pf_p2;
+	always_ff @(posedge clk) if (pf_write_now && !pf_plane &&  pf_back_sel) rd1_lane3[pf_qw_idx] <= pf_p3;
+	always_ff @(posedge clk) if (pf_write_now &&  pf_plane && !pf_back_sel) tm_rd0[pf_qw_idx] <= pf_qword;
+	always_ff @(posedge clk) if (pf_write_now &&  pf_plane &&  pf_back_sel) tm_rd1[pf_qw_idx] <= pf_qword;
 
 	always_ff @(posedge clk) begin
 		if (reset) begin
 			hblank_r     <= 1'b0;
 			pf_active    <= 1'b0;
 			pf_row_ok    <= 1'b0;
+			pf_plane     <= 1'b0;
 			rd_front_sel <= 1'b0;
 			rd_front_row <= 8'hff; // never matches a real row at reset
+			tm_front_sel <= 1'b0;
+			tm_front_row <= 8'hff;
 		end else begin
 			hblank_r <= hblank;
 			if (!pf_active) begin
@@ -352,9 +387,24 @@ module rle_objects #(
 					pf_row_ok   <= pf_next_line_ok;
 				end
 			end else if (pf_qw_idx >= FB_ROW_QW[6:0]) begin
-				pf_active    <= 1'b0;
-				rd_front_sel <= pf_back_sel;
-				rd_front_row <= pf_row;
+				if (pf_plane) begin
+					pf_active    <= 1'b0;
+					pf_plane     <= 1'b0;
+					tm_front_sel <= pf_back_sel;
+					tm_front_row <= pf_row;
+				end else begin
+					rd_front_sel <= pf_back_sel;
+					rd_front_row <= pf_row;
+					if (tmek) begin
+						pf_plane    <= 1'b1;
+						pf_qw_idx   <= 7'd0;
+						pf_burst_qw <= 4'd0;
+						pf_back_sel <= ~tm_front_sel;
+						pf_row_ok   <= pf_tm_row_ok;
+					end else begin
+						pf_active <= 1'b0;
+					end
+				end
 			end else if (pf_burst_qw > 0) begin
 				if (pf_word_ok) begin
 					pf_qw_idx   <= pf_qw_idx + 7'd1;
@@ -522,6 +572,8 @@ module rle_objects #(
 			objectcount_r  <= 24'd0;
 			row_valid0     <= {FB_H{1'b0}};
 			row_valid1     <= {FB_H{1'b0}};
+			tm_valid0      <= {FB_H{1'b0}};
+			tm_valid1      <= {FB_H{1'b0}};
 		end else begin
 			// default one-cycle pulses
 			fb_wr_en  <= 1'b0;
@@ -846,8 +898,13 @@ module rle_objects #(
 			// erase is now a bit-vector clear, not 80640 writes: DDR3
 			// content is untouched, a row reads zero until its first flush
 			S_DRAW_ERASE: begin
-				if (fb_wr_buf) row_valid1 <= {FB_H{1'b0}};
-				else            row_valid0 <= {FB_H{1'b0}};
+				if (fb_wr_buf) begin
+					row_valid1 <= {FB_H{1'b0}};
+					tm_valid1  <= {FB_H{1'b0}};
+				end else begin
+					row_valid0 <= {FB_H{1'b0}};
+					tm_valid0  <= {FB_H{1'b0}};
+				end
 				cache_idx <= 8'd0;
 				state     <= S_DRAW_CACHE_ORDER;
 			end
@@ -907,7 +964,7 @@ module rle_objects #(
 
 				if (field_idx == 3'd4) begin
 					scale_r <= oram_i_dout_r;
-					if (oram_i_dout_r == 16'h0 || ({9'h0, code_r} >= objectcount_r) || vram_r) begin
+					if (oram_i_dout_r == 16'h0 || ({9'h0, code_r} >= objectcount_r) || (vram_r && !tmek)) begin
 						state <= S_DRAW_OBJ_NEXT;
 					end else begin
 						hdr_idx      <= 2'd0;
@@ -1094,7 +1151,7 @@ module rle_objects #(
 			// zero-fill step: the assembly arrays are never cleared, the
 			// flush itself sends 0 for any lane that is not dirty.
 			S_FB_ROW_OPEN: begin
-				if (asm_open && asm_buf == fb_wr_buf && asm_row == cur_y[7:0]) begin
+				if (asm_open && asm_buf == fb_wr_buf && asm_plane == vram_r && asm_row == cur_y[7:0]) begin
 					state <= S_DRAW_ROW_ADV_CHECK; // already the right row
 				end else if (asm_open) begin
 					return_state <= S_FB_ROW_OPEN2;
@@ -1106,9 +1163,11 @@ module rle_objects #(
 			end
 			S_FB_ROW_OPEN2: begin
 				asm_buf  <= fb_wr_buf;
+				asm_plane <= vram_r;
 				asm_row  <= cur_y[7:0];
 				asm_open <= 1'b1;
-				asm_first_touch <= fb_wr_buf ? !row_valid1[cur_y] : !row_valid0[cur_y];
+				asm_first_touch <= vram_r ? (fb_wr_buf ? !tm_valid1[cur_y[7:0]] : !tm_valid0[cur_y[7:0]]) :
+								   (fb_wr_buf ? !row_valid1[cur_y] : !row_valid0[cur_y]);
 				state <= S_DRAW_ROW_ADV_CHECK;
 			end
 
@@ -1118,8 +1177,11 @@ module rle_objects #(
 			// lanes alone
 			S_FB_FLUSH_SCAN: begin
 				if (flush_qw_idx >= FB_ROW_QW[6:0]) begin
-					if (asm_buf) row_valid1[asm_row] <= 1'b1;
-					else          row_valid0[asm_row] <= 1'b1;
+					if (asm_plane) begin
+						if (asm_buf) tm_valid1[asm_row] <= 1'b1;
+						else          tm_valid0[asm_row] <= 1'b1;
+					end else if (asm_buf) row_valid1[asm_row] <= 1'b1;
+					else                  row_valid0[asm_row] <= 1'b1;
 					asm_open <= 1'b0;
 					state    <= return_state;
 				end else begin
@@ -1384,7 +1446,8 @@ module rle_objects #(
 					ddr_be       <= 8'hff;
 				end
 				OWN_FLUSH: begin
-					ddr_addr     <= (asm_buf ? FB1_QW_BASE : FB0_QW_BASE) +
+					ddr_addr     <= (asm_plane ? (asm_buf ? TM1_QW_BASE : TM0_QW_BASE) :
+											 (asm_buf ? FB1_QW_BASE : FB0_QW_BASE)) +
 									{14'h0, asm_row, 7'b0} + {22'h0, flush_qw_idx};
 					ddr_we       <= 1'b1;
 					ddr_burstcnt <= 8'd1;

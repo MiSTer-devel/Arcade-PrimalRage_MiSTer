@@ -45,6 +45,8 @@ localparam CONF_STR = {
 	"-;",
 	"O[19:18],Volume,100%,50%,25%,12.5%;",
 	"O[7],Service Mode,Off,On;",
+	"H1O[33],T-MEK Sticks,Modern,Arcade;",
+	"H1O[34],T-MEK Swap Sticks,No,Yes;",
 	"O[31],Autosave NVRAM,Off,On;",
 	"T[32],Save NVRAM;",
 	"-;",
@@ -60,12 +62,14 @@ wire forced_scandoubler;
 wire [1:0] buttons;
 wire [127:0] status;
 wire [31:0] joystick_0, joystick_1;
+wire [15:0] joystick_l_analog_0, joystick_r_analog_0;
 
 wire        ioctl_download;
 wire [15:0] ioctl_index;
 wire        ioctl_wr;
 wire [26:0] ioctl_addr;
 wire  [7:0] ioctl_dout;
+reg         is_tmek = 1'b0;
 wire        ioctl_wait;
 
 wire        nv_upload_req;
@@ -88,10 +92,12 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 
 	.buttons(buttons),
 	.status(status),
-	.status_menumask({status[5]}),
+	.status_menumask({~is_tmek, status[5]}),
 
 	.joystick_0(joystick_0),
 	.joystick_1(joystick_1),
+	.joystick_l_analog_0(joystick_l_analog_0),
+	.joystick_r_analog_0(joystick_r_analog_0),
 
 	.ioctl_download(ioctl_download),
 	.ioctl_index(ioctl_index),
@@ -138,6 +144,11 @@ reg set_jan = 1'b0;
 always @(posedge clk_sys)
 	if (ioctl_download && (ioctl_index[7:0] == 8'd1) && ioctl_wr && (ioctl_addr == 27'd0))
 		set_jan <= ioctl_dout[0];
+
+// mod byte bit1: tmek.mra sends 02
+always @(posedge clk_sys)
+	if (ioctl_download && (ioctl_index[7:0] == 8'd1) && ioctl_wr && (ioctl_addr == 27'd0))
+		is_tmek <= ioctl_dout[1];
 
 // a late NVRAM load must reset the CPU and CAGE the same way an OSD
 // reset would, so the write lands cleanly
@@ -240,6 +251,9 @@ rom_ddr_replay rom_ddr_replay
 	.ddr_busy(stg_ddr_busy)
 );
 
+// ddr_lat_meter words (see below the ddr_arbiter)
+wire [63:0] lat_win, lat_max;
+
 rom_loader rom_loader
 (
 	.clk(clk_sys),
@@ -277,7 +291,9 @@ rom_loader rom_loader
 	.cpu_reset_in(cpu_reset),
 	.loader_sel_in(loader_sel),
 	.ddr_busy_in(DDRAM_BUSY),
-	.dsp_we_count_in(cage_dsp_we_count)
+	.dsp_we_count_in(cage_dsp_we_count),
+	.lat_win(lat_win),
+	.lat_max(lat_max)
 );
 
 ///////////////////////   DDR3 ARBITER   ///////////////////////////
@@ -356,6 +372,23 @@ ddr_arbiter ddr_arbiter
 	.DDRAM_BE(DDRAM_BE),
 	.DDRAM_WE(DDRAM_WE)
 );
+
+// DDR_LAT_DIAG (set only in a staged qsf for a diagnostic build): first-word read
+// latency of every DDR3 read, into debug qwords 5/6 (0x33000028, 0x33000030)
+`ifdef DDR_LAT_DIAG
+ddr_lat_meter ddr_lat_meter
+(
+	.clk(clk_sys),
+	.reset(~pll_locked),
+	.rd_acc(DDRAM_RD & ~DDRAM_BUSY),
+	.dout_ready(DDRAM_DOUT_READY),
+	.win_q(lat_win),
+	.max_q(lat_max)
+);
+`else
+assign lat_win = 64'd0;
+assign lat_max = 64'd0;
+`endif
 
 ///////////////////////   SDRAM   //////////////////////////////////
 
@@ -464,6 +497,7 @@ wire  [7:0] vid_r, vid_g, vid_b;
 wire [31:0] p1p2;
 wire [15:0] service;
 wire [15:0] coin;
+wire [31:0] analog;
 
 cpu_bus cpu_bus
 (
@@ -502,6 +536,8 @@ cpu_bus cpu_bus
 	.xga_override(xga_override),
 	.xga_dout(xga_dout),
 
+	.tmek(is_tmek),
+
 	.latch(latch),
 	.mo_control(mo_control),
 	.mo_command(mo_command),
@@ -514,6 +550,7 @@ cpu_bus cpu_bus
 	.service(service),
 	.coin(coin),
 	.vblank(vblank),
+	.analog(analog),
 	.xga_busy(xga_busy),
 
 	.clk_nv(clk_sys),
@@ -545,6 +582,7 @@ cage cage
 	.reset(reset),
 	.rom_download(rom_download),
 	.prescan_done(prescan_done),
+	.tmek(is_tmek),
 
 	.clk_cpu(clk_cpu),
 	.cage_data_wr(cage_data_wr),
@@ -589,6 +627,7 @@ xga_prot xga_prot
 	.din(xga_din),
 	.we(xga_we),
 	.rd(xga_rd),
+	.tmek(is_tmek),
 
 	.override(xga_override),
 	.dout(xga_dout),
@@ -598,12 +637,15 @@ xga_prot xga_prot
 wire  [8:0] fb_rd_x;
 wire  [7:0] fb_rd_y;
 wire [15:0] fb_rd_data;
+wire [15:0] tm_rd_data;
 
 atarigt_video atarigt_video
 (
 	.clk(clk_sys),
 	.clk_cpu(clk_cpu),
 	.reset(~pll_locked), // video timing keeps running through the OSD reset and the ROM upload, so the framework can draw the loading bar
+	.tmek(is_tmek),
+	.tm_rd_data(tm_rd_data),
 
 	.ce_pix(ce_pix),
 	.hblank(hblank),
@@ -665,6 +707,8 @@ rle_objects rle_objects
 
 	.fb_rd_x(fb_rd_x),
 	.fb_rd_y(fb_rd_y),
+	.tmek(is_tmek),
+	.fb_rd_tm(tm_rd_data),
 	.fb_rd_data(fb_rd_data),
 	.fb_rd_frame(mo_control[2]),
 
@@ -692,8 +736,15 @@ atarigt_inputs inputs
 	.joystick_0(joystick_0),
 	.joystick_1(joystick_1),
 	.set_jan(set_jan),
+	.tmek(is_tmek),
+	.joystick_l_analog_0(joystick_l_analog_0),
+	.joystick_r_analog_0(joystick_r_analog_0),
+	.stick_modern(~status[33]),
+	.stick_swap(status[34]),
+	.service_mode(status[7]),
 	.p1p2(p1p2),
-	.coin(coin)
+	.coin(coin),
+	.analog(analog)
 );
 
 // bit7 = VBLANK (active high), bit6 = SELFTEST (active low, status[7] set = test menu)
@@ -894,7 +945,10 @@ module rom_loader
 	input             cpu_reset_in,
 	input             loader_sel_in,
 	input             ddr_busy_in,
-	input      [15:0] dsp_we_count_in
+	input      [15:0] dsp_we_count_in,
+	// DDR_LAT_DIAG builds only: ddr_lat_meter words for q5/q6
+	input      [63:0] lat_win,
+	input      [63:0] lat_max
 );
 
 // declared here, ahead of do_pop's use below, so a plain iverilog -g2012
@@ -1001,7 +1055,7 @@ wire dl_end_edge   = ~ioctl_download & dl_raw_d;
 reg [25:0] hb_div;
 reg [31:0] heartbeat;
 
-localparam DBG_IDLE=0, DBG_Q0=1, DBG_Q1=2, DBG_Q2=3, DBG_Q3=4, DBG_Q4=5, DBG_Q5=6;
+localparam DBG_IDLE=0, DBG_Q0=1, DBG_Q1=2, DBG_Q2=3, DBG_Q3=4, DBG_Q4=5, DBG_Q5=6, DBG_Q6=7;
 reg [2:0] dbg_state;
 assign dbg_active = (dbg_state != DBG_IDLE);
 
@@ -1192,13 +1246,29 @@ always @(posedge clk) begin
 				end
 				DBG_Q4: begin
 					ddr_addr <= DEBUG_ADDR + 29'd5;
+`ifdef DDR_LAT_DIAG
+					ddr_din  <= lat_win;
+`else
 					ddr_din  <= first8_bytes;
+`endif
 					ddr_be   <= 8'hff;
 					ddr_we   <= 1'b1;
 					pend_ddr <= 1'b1;
 					dbg_state <= DBG_Q5;
 				end
+`ifdef DDR_LAT_DIAG
+				DBG_Q5: begin
+					ddr_addr <= DEBUG_ADDR + 29'd6;
+					ddr_din  <= lat_max;
+					ddr_be   <= 8'hff;
+					ddr_we   <= 1'b1;
+					pend_ddr <= 1'b1;
+					dbg_state <= DBG_Q6;
+				end
+				DBG_Q6: dbg_state <= DBG_IDLE;
+`else
 				DBG_Q5: dbg_state <= DBG_IDLE;
+`endif
 				default: dbg_state <= DBG_IDLE;
 			endcase
 		end

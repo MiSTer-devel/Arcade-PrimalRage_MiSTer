@@ -11,6 +11,8 @@ module cpu_bus_decode (
 	output logic [15:0] cpu_din,
 	output logic         cpu_ready,
 
+	input  logic         tmek,
+
 	output logic [24:1] sdram_addr,
 	output logic [15:0] sdram_din,
 	output logic         sdram_wrl,
@@ -65,6 +67,10 @@ module cpu_bus_decode (
 	input  logic [15:0] coin,
 	input  logic         vblank,
 
+	// T-MEK ADC0809 analog axes, packed per atarigt_inputs.sv: [7:0]=ch2,
+	// [15:8]=ch3, [23:16]=ch6, [31:24]=ch7
+	input  logic [31:0] analog,
+
 	input  logic         xga_busy,
 
 	input  logic         clk_nv,
@@ -80,6 +86,11 @@ module cpu_bus_decode (
 	localparam [1:0] ST_DELAY  = 2'd2;
 	localparam [1:0] ST_DELAY2 = 2'd3;
 
+	// MAME adc0808.cpp: 1 + 64 ADC clocks to convert, EOC 1 clock later;
+	// ADC clock = 14.318181 MHz/16 = 894.9 kHz, 66 clocks = 73.8 us,
+	// clk_cpu = 42.955 MHz -> 3168 clk_cpu ticks (research notes, adc finding)
+	localparam [11:0] ADC_CONV_CLKS = 12'd3168;
+
 	logic [1:0] state;
 	logic       cage_rd_expect;
 	logic       req_toggle_r;
@@ -90,6 +101,17 @@ module cpu_bus_decode (
 	logic        xga_override_r;
 	logic [15:0] xga_dout_r;
 	logic        vblank_prev;
+	logic        pal_ignore; // T-MEK: colour writes are dropped while set (MAME atarigt.cpp colorram_protection_w)
+
+	// T-MEK ADC0809 model (MAME atarigt.cpp analog_port_r): adc_q is the
+	// shared result register; clk_cpu may get no reset edge before its first use,
+	// so eoc (SERVICE bit3) derives from adc_busy instead of its own register
+	logic [7:0]  adc_q;
+	logic        adc_busy;
+	logic [11:0] adc_cnt;
+	logic [2:0]  adc_ch_active;
+	logic        adc_trig_seen;
+	wire         eoc = !adc_busy;
 
 	// address decode, byte addresses, upper bits assumed zero
 	wire [23:0] a = cpu_addr[23:0];
@@ -107,6 +129,8 @@ module cpu_bus_decode (
 	wire is_p1p2    = (a >= 24'hE80000) && (a < 24'hE80004);
 	wire is_service = (a >= 24'hE82000) && (a < 24'hE82004);
 	wire is_coin    = (a >= 24'hE82004) && (a < 24'hE82008);
+	// T-MEK's palette write-enable colour word (xga_prot's TM_COLOR, word 0x18000 = byte DB0000)
+	wire is_tm_color = is_cram && (cpu_addr[18:1] == 18'h18000);
 
 	wire need_sdram = (is_rom && cpu_rd) || (is_workram && (cpu_rd || cpu_wr));
 	wire need_wait  = cpu_rd && (is_cram || is_vidram || is_eeprom || is_cage);
@@ -123,8 +147,23 @@ module cpu_bus_decode (
 	wire        cage_rd_wait = is_cage && !addr_lo && cpu_rd;
 	wire [15:0] p1p2_hi    = p1p2[31:16];
 	wire [15:0] p1p2_lo    = p1p2[15:0];
-	// bit 7 is the live VBLANK signal (atarigt.cpp SERVICE port), not a switch
-	wire [15:0] service_eff = {service[15:8], vblank, service[6:0]};
+	// bit 7 is the live VBLANK signal (atarigt.cpp SERVICE port), not a switch;
+	// bit 3 is A2D.EOC when tmek (MAME atarigt.cpp:472), else the switch as-is
+	wire [15:0] service_eff = {service[15:8], vblank, service[6:4],
+	                            (tmek ? eoc : service[3]), service[2:0]};
+
+	// is_analog spans 0xD00010-0xD0001E word-aligned, ch = (a-0x10)/2
+	wire [2:0] analog_ch = a[3:1];
+
+	function automatic [7:0] adc_channel_byte(input [2:0] ch, input [31:0] an);
+		case (ch)
+			3'd2:    adc_channel_byte = an[7:0];
+			3'd3:    adc_channel_byte = an[15:8];
+			3'd6:    adc_channel_byte = an[23:16];
+			3'd7:    adc_channel_byte = an[31:24];
+			default: adc_channel_byte = 8'hff;
+		endcase
+	endfunction
 
 	logic [7:0] eeprom_q, eeprom_q_inv, nv_q_inv;
 
@@ -184,7 +223,7 @@ module cpu_bus_decode (
 				cpu_din = vram_dout;
 		end else begin
 			if (is_analog)
-				cpu_din = 16'hFF00;
+				cpu_din = tmek ? {adc_q, 8'h00} : 16'hFF00;
 			else if (is_p1p2)
 				cpu_din = addr_lo ? p1p2_lo : p1p2_hi;
 			else if (is_service)
@@ -204,13 +243,55 @@ module cpu_bus_decode (
 
 	assign cram_addr = cpu_addr[18:1];
 	assign cram_din  = cpu_dout;
-	assign cram_we   = (state == ST_IDLE && cpu_wr && is_cram && cram_ok) ? {cpu_uds, cpu_lds} : 2'b00;
+	assign cram_we   = (state == ST_IDLE && cpu_wr && is_cram && cram_ok && !(tmek && pal_ignore)) ? {cpu_uds, cpu_lds} : 2'b00;
 	assign cram_rd   = (state == ST_IDLE && cpu_rd && is_cram && cram_ok);
 
 	assign xga_addr = cpu_addr[18:1];
 	assign xga_din  = cpu_dout;
 	assign xga_we   = (state == ST_IDLE && cpu_wr && is_cram && cram_ok);
 	assign xga_rd   = cram_rd;
+
+	// T-MEK: writing 0x0018 to TM_COLOR arms pal_ignore, dropping colour RAM
+	// writes (not xga_we) until a write of anything else there clears it;
+	// the cram_we gate above reads pal_ignore before this block updates it
+	always_ff @(posedge clk_cpu) begin
+		if (reset)
+			pal_ignore <= 1'b0;
+		else if (tmek && state == ST_IDLE && cpu_wr && cram_ok && is_tm_color)
+			pal_ignore <= (cpu_dout == 16'h0018);
+	end
+
+	// analog reads have no wait state, so a held cpu_rd would retrigger
+	// every clock without an edge detect; adc_trig_seen keeps it to one
+	// conversion per read
+	wire analog_active = tmek && state == ST_IDLE && cpu_rd && is_analog;
+
+	always_ff @(posedge clk_cpu) begin
+		if (reset)
+			adc_trig_seen <= 1'b0;
+		else
+			adc_trig_seen <= analog_active;
+	end
+
+	always_ff @(posedge clk_cpu) begin
+		if (reset) begin
+			adc_q         <= 8'h00;
+			adc_busy      <= 1'b0;
+			adc_cnt       <= 12'd0;
+			adc_ch_active <= 3'd0;
+		end else if (analog_active && !adc_trig_seen) begin
+			adc_busy      <= 1'b1;
+			adc_cnt       <= ADC_CONV_CLKS - 12'd1;
+			adc_ch_active <= analog_ch;
+		end else if (adc_busy) begin
+			if (adc_cnt == 12'd0) begin
+				adc_q    <= adc_channel_byte(adc_ch_active, analog);
+				adc_busy <= 1'b0;
+			end else begin
+				adc_cnt <= adc_cnt - 12'd1;
+			end
+		end
+	end
 
 	assign cage_wdata   = cpu_dout;
 	assign cage_data_wr = (state == ST_IDLE && cpu_wr && is_cage && !addr_lo);
@@ -324,6 +405,8 @@ module cpu_bus (
 	input  logic reset,
 	input  logic cpu_reset,
 
+	input  logic tmek,
+
 	output logic [24:1] sdram_addr,
 	output logic [15:0] sdram_din,
 	output logic         sdram_wrl,
@@ -377,6 +460,8 @@ module cpu_bus (
 	input  logic [15:0] coin,
 	input  logic         vblank,
 
+	input  logic [31:0] analog,
+
 	input  logic         xga_busy,
 
 	input  logic         clk_nv,
@@ -408,6 +493,7 @@ module cpu_bus (
 		.cpu_rd(cpu_rd), .cpu_wr(cpu_wr),
 		.cpu_uds(~nuds), .cpu_lds(~nlds),
 		.cpu_din(cpu_din), .cpu_ready(cpu_ready),
+		.tmek(tmek),
 		.sdram_addr(sdram_addr), .sdram_din(sdram_din),
 		.sdram_wrl(sdram_wrl), .sdram_wrh(sdram_wrh),
 		.sdram_req(sdram_req), .sdram_ack(sdram_ack), .sdram_dout(sdram_dout),
@@ -424,7 +510,7 @@ module cpu_bus (
 		.scan_tick(scan_tick),
 		.irq_scanline(irq_scanline), .irq_vblank(irq_vblank), .ipl(ipl),
 		.p1p2(p1p2), .service(service), .coin(coin),
-		.vblank(vblank), .xga_busy(xga_busy),
+		.vblank(vblank), .analog(analog), .xga_busy(xga_busy),
 		.clk_nv(clk_nv), .nv_addr(nv_addr), .nv_din(nv_din), .nv_we(nv_we),
 		.nv_q(nv_q), .nv_wr_toggle(nv_wr_toggle)
 	);

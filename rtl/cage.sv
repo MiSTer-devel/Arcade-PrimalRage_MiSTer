@@ -8,6 +8,7 @@ module cage
 	input         reset,        // clk_sys-domain system reset
 	input         rom_download, // hold CAGE in reset during the ROM load
 	input         prescan_done, // unused: kept for port compatibility
+	input         tmek,         // widens cage_mem's sound ROM window to T-MEK's 8MB
 
 	// host port, clk_cpu domain, from cpu_bus
 	input         clk_cpu,
@@ -197,6 +198,7 @@ cage_mem cage_mem
 	// time, so boot_done could never fire. Use cage_reset (clears at the
 	// start of CG_BOOT) instead.
 	.reset(cage_reset),
+	.tmek(tmek),
 
 	.req(cm_req_i),
 	.req_id(cm_req_id_i),
